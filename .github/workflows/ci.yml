@@ -4,6 +4,7 @@
 #   Secrets: ACTION_TOKEN (can checkout source repo hiring-scout), REMOTE_SSH_KEY
 #   Variables: AWS_ROLE_ARN, AWS_REGION, REMOTE_USER, AWS_ECR_REPOSITORY (e.g. hiring-scout)
 # Env is baked into the image per ACTIVE at build time by the Dockerfile (--build-arg ACTIVE); the source repo's env/{dev,prod}.env must be committed.
+# The run's success/failure is decided by build-and-deploy alone; prune-images and notify-teams cannot fail the run.
 name: hiring-scout - Build & Push Docker
 
 on:
@@ -22,7 +23,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  action_trigger:
+  build-and-deploy:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/hiring-scout/')
     runs-on: ubuntu-latest
     permissions:
@@ -30,6 +31,19 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
+    # Exposed so prune-images / notify-teams can run as separate jobs without re-parsing the Release.
+    outputs:
+      remote_host: ${{ steps.deploy-vars.outputs.remote_host }}
+      teams_webhook: ${{ steps.deploy-vars.outputs.teams_webhook }}
+      active: ${{ steps.deploy-vars.outputs.active }}
+      image_tag: ${{ steps.deploy-vars.outputs.image_tag }}
+      ecr_registry: ${{ steps.login-pf-aws-ecr.outputs.registry }}
+      source_repo: ${{ steps.relinfo.outputs.source_repo }}
+      commit_sha: ${{ steps.relinfo.outputs.commit_sha }}
+      commit_short: ${{ steps.relinfo.outputs.commit_short }}
+      commit_message: ${{ steps.relinfo.outputs.commit_message }}
+      commit_url: ${{ steps.relinfo.outputs.commit_url }}
+      release_notes: ${{ steps.relinfo.outputs.release_notes }}
     steps:
       # release event: Parse-Action-Tag parses github.event.release.body and exports env
       - name: get tag info
@@ -60,12 +74,52 @@ jobs:
             (.envValue | to_entries[] | "\(.key)=\(.value)")
           ' >> "$GITHUB_ENV"
 
+      # Runs before the build so notify-teams still has the webhook/tag when a later step fails.
+      - name: Export deploy vars
+        id: deploy-vars
+        run: |
+          {
+            echo "remote_host=${{ env.REMOTE_HOST }}"
+            echo "teams_webhook=${{ env.TEAMS_WEBHOOK }}"
+            echo "active=${{ env.ACTIVE }}"
+            echo "image_tag=${{ env.BRANCH }}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           repository: SeeChange-edu/${{ env.REPOSITORY }}
           token: ${{ secrets.ACTION_TOKEN }}
           ref: ${{ env.BRANCH }}
+
+      # Commit + release notes for the Teams card. Runs before the build so a failed build still notifies with context.
+      - name: Collect commit and release info
+        id: relinfo
+        env:
+          GH_TOKEN: ${{ secrets.ACTION_TOKEN }}
+          SRC_REPO: SeeChange-edu/${{ env.REPOSITORY }}
+          REF: ${{ env.BRANCH }}
+        run: |
+          SHA=$(git rev-parse HEAD)
+          SHORT=$(git rev-parse --short HEAD)
+          SUBJECT=$(git log -1 --pretty=%s)
+          # Release notes exist only when BRANCH is a release tag (prod); empty for branch deploys (dev).
+          NOTES=$(gh release view "$REF" --repo "$SRC_REPO" --json body -q .body 2>/dev/null | head -c 1500 || true)
+          # Fallback text keeps the card's notes block non-empty (avoids relying on Adaptive Card isVisible).
+          if [ -z "$NOTES" ]; then NOTES="_(no release notes — branch deploy)_"; fi
+          D=$(openssl rand -hex 8)
+          {
+            echo "source_repo=$SRC_REPO"
+            echo "commit_sha=$SHA"
+            echo "commit_short=$SHORT"
+            echo "commit_url=${{ github.server_url }}/$SRC_REPO/commit/$SHA"
+            echo "commit_message<<$D"
+            echo "$SUBJECT"
+            echo "$D"
+            echo "release_notes<<$D"
+            echo "$NOTES"
+            echo "$D"
+          } >> "$GITHUB_OUTPUT"
 
       # Build happens inside the multi-stage Dockerfile (npm ci + npm run build), so no separate Node build step here.
       - name: Setup AWS ECR Details (OIDC)
@@ -121,17 +175,22 @@ jobs:
             docker image prune --force
             docker container prune --force
 
+  # Housekeeping only: never fails the run.
+  prune-images:
+    needs: [build-and-deploy]
+    if: needs.build-and-deploy.result == 'success'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
       - name: Prune old semver Docker images
-        if: success()
-        continue-on-error: true
         uses: appleboy/ssh-action@v1.2.0
         env:
-          ECR_REGISTRY: ${{ steps.login-pf-aws-ecr.outputs.registry }}
+          ECR_REGISTRY: ${{ needs.build-and-deploy.outputs.ecr_registry }}
           ECR_REPOSITORY: ${{ vars.AWS_ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ env.BRANCH }}
-          ACTIVE: ${{ env.ACTIVE }}
+          IMAGE_TAG: ${{ needs.build-and-deploy.outputs.image_tag }}
+          ACTIVE: ${{ needs.build-and-deploy.outputs.active }}
         with:
-          host: ${{ env.REMOTE_HOST }}
+          host: ${{ needs.build-and-deploy.outputs.remote_host }}
           username: ${{ vars.REMOTE_USER }}
           key: ${{ secrets.REMOTE_SSH_KEY }}
           envs: ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,ACTIVE
@@ -169,40 +228,101 @@ jobs:
               docker rmi "${IMAGE_PREFIX}:${tag}" 2>/dev/null || true
             done
 
+  # Notification only: never fails the run.
+  # Targets the Teams "Workflows" webhook (Post to a channel when a webhook request is received),
+  # which renders the Adaptive Card in attachments[0].content as-is.
   notify-teams:
-    if: always()
-    needs: [action_trigger]
+    needs: [build-and-deploy]
+    if: always() && needs.build-and-deploy.outputs.teams_webhook != ''
+    continue-on-error: true
     runs-on: ubuntu-latest
     steps:
-      - name: get tag info
-        if: github.event_name == 'release'
-        uses: Seechange-edu/Parse-Action-Tag@main
-        with:
-          githubToken: ${{ secrets.ACTION_TOKEN }}
-          type: parse
-
-      - name: Send Teams Notification
-        if: env.TEAMS_WEBHOOK != ''
+      - name: Send Teams notification (Power Automate)
         env:
-          WEBHOOK: ${{ env.TEAMS_WEBHOOK }}
+          WEBHOOK: ${{ needs.build-and-deploy.outputs.teams_webhook }}
+          STATUS: ${{ needs.build-and-deploy.result }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_REPO: ${{ needs.build-and-deploy.outputs.source_repo }}
+          ENVIRONMENT: ${{ needs.build-and-deploy.outputs.active }}
+          TAG: ${{ needs.build-and-deploy.outputs.image_tag }}
+          COMMIT_SHA: ${{ needs.build-and-deploy.outputs.commit_sha }}
+          COMMIT_SHORT: ${{ needs.build-and-deploy.outputs.commit_short }}
+          COMMIT_MESSAGE: ${{ needs.build-and-deploy.outputs.commit_message }}
+          COMMIT_URL: ${{ needs.build-and-deploy.outputs.commit_url }}
+          RELEASE_NOTES: ${{ needs.build-and-deploy.outputs.release_notes }}
+          ACTOR: ${{ github.actor }}
+          EVENT: ${{ github.event_name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          curl -X POST -H "Content-Type: application/json" \
-          -d '{
-            "@type": "MessageCard",
-            "@context": "http://schema.org/extensions",
-            "themeColor": "${{ needs.action_trigger.result == 'success' && '00FF00' || 'FF0000' }}",
-            "summary": "${{ needs.action_trigger.result == 'success' && '🎉 Build succeeded!' || '❌ Build failed!' }}",
-            "title": "${{ needs.action_trigger.result == 'success' && '🎉 Build succeeded!' || '❌ Build failed!' }}: ${{ github.repository }}: ${{ github.workflow }}",
-            "sections": [{
-              "facts": [
-                { "name": "Repository", "value": "${{ github.repository }}" },
-                { "name": "Triggered by", "value": "${{ github.event_name }}" },
-                { "name": "Commit Message", "value": "${{ github.event.head_commit.message }}" },
-                { "name": "Author", "value": "@${{ github.actor }}" },
-                { "name": "Result", "value": "${{ needs.action_trigger.result }}" }
-              ],
-              "text": "[View Workflow Run](${{ env.RUN_URL }})"
-            }]
-          }' \
-          "$WEBHOOK"
+          # jq builds the whole Adaptive Card so release notes / commit messages are escaped safely.
+          # The Teams Workflows webhook renders attachments[0].content verbatim.
+          jq -n \
+            --arg status "$STATUS" \
+            --arg source_repo "$SOURCE_REPO" \
+            --arg environment "$ENVIRONMENT" \
+            --arg tag "$TAG" \
+            --arg commit_short "$COMMIT_SHORT" \
+            --arg commit_message "$COMMIT_MESSAGE" \
+            --arg commit_url "$COMMIT_URL" \
+            --arg release_notes "$RELEASE_NOTES" \
+            --arg actor "$ACTOR" \
+            --arg event "$EVENT" \
+            --arg run_url "$RUN_URL" \
+            '{
+              type: "message",
+              attachments: [{
+                contentType: "application/vnd.microsoft.card.adaptive",
+                contentUrl: null,
+                content: {
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  type: "AdaptiveCard",
+                  version: "1.4",
+                  msteams: { width: "Full" },
+                  body: [
+                    {
+                      type: "Container",
+                      style: (if $status == "success" then "good" else "attention" end),
+                      bleed: true,
+                      items: [
+                        {
+                          type: "TextBlock",
+                          text: (if $status == "success" then "✅ Deploy succeeded" else "❌ Deploy failed" end),
+                          weight: "Bolder",
+                          size: "Medium",
+                          wrap: true
+                        },
+                        {
+                          type: "TextBlock",
+                          text: ($source_repo + " → " + $environment),
+                          spacing: "None",
+                          isSubtle: true,
+                          wrap: true
+                        }
+                      ]
+                    },
+                    {
+                      type: "FactSet",
+                      facts: [
+                        { title: "Environment", value: $environment },
+                        { title: "Tag / Branch", value: $tag },
+                        { title: "Commit", value: ("[" + $commit_short + "](" + $commit_url + ")") },
+                        { title: "Commit message", value: $commit_message },
+                        { title: "Triggered by", value: ($actor + " (" + $event + ")") },
+                        { title: "Result", value: $status }
+                      ]
+                    },
+                    { type: "TextBlock", text: "**Release notes**", wrap: true, spacing: "Medium" },
+                    {
+                      type: "Container",
+                      style: "emphasis",
+                      items: [ { type: "TextBlock", text: $release_notes, wrap: true } ]
+                    }
+                  ],
+                  actions: [
+                    { type: "Action.OpenUrl", title: "View workflow run", url: $run_url },
+                    { type: "Action.OpenUrl", title: "View commit", url: $commit_url }
+                  ]
+                }
+              }]
+            }' \
+          | curl -sS --fail-with-body -X POST -H 'Content-Type: application/json' --data @- "$WEBHOOK"
