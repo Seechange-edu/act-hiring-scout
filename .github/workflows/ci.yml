@@ -173,7 +173,9 @@ jobs:
             fi
             docker run --name ${{ env.NAME }} -d -p ${{ env.OUT_PORT }}:${{ env.PORT }} ${{ env.RUN_ARGS }} --restart unless-stopped ${IMAGE_URI}
             docker image prune --force
-            docker container prune --force
+            # Disabled: the old container is already removed by name above, and pruning here would delete
+            # a container that crashed on startup, taking its logs with it.
+            # docker container prune --force
 
   # Housekeeping only: never fails the run.
   prune-images:
