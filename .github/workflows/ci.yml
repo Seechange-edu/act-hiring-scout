@@ -3,7 +3,7 @@
 # Configure in this repo's Settings -> Secrets and variables -> Actions:
 #   Secrets: ACTION_TOKEN (can checkout source repo hiring-scout), REMOTE_SSH_KEY
 #   Variables: AWS_ROLE_ARN, AWS_REGION, REMOTE_USER, AWS_ECR_REPOSITORY (e.g. hiring-scout)
-# Env is baked into the image per ACTIVE at build time by the Dockerfile (--build-arg ACTIVE); the source repo's env/{dev,prod}.env must be committed.
+# Env is NOT baked into the image. It is injected at runtime via `docker run --env-file` from the deploy host at ~/env.hiring-scout/${ACTIVE}.env (dev.env | prod.env); that file must exist on REMOTE_HOST and is not committed to the source repo.
 # The run's success/failure is decided by build-and-deploy alone; prune-images and notify-teams cannot fail the run.
 name: hiring-scout - Build & Push Docker
 
@@ -141,7 +141,7 @@ jobs:
         run: |
           IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}/${{ env.ACTIVE }}:${IMAGE_TAG}"
           echo "IMAGE_URI=${IMAGE_URI}" >> $GITHUB_ENV
-          docker build --build-arg ACTIVE=${{ env.ACTIVE }} --tag ${IMAGE_URI} --file Dockerfile .
+          docker build --tag ${IMAGE_URI} --file Dockerfile .
           docker push ${IMAGE_URI}
 
       - name: Get ECR login token
@@ -167,11 +167,18 @@ jobs:
             # Login to AWS ECR using temporary token from GitHub Actions
             echo ${ECR_TOKEN} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
 
+            # Env is injected at runtime from the deploy host, not baked into the image.
+            ENV_FILE="$HOME/env.hiring-scout/${{ env.ACTIVE }}.env"
+            if [ ! -f "$ENV_FILE" ]; then
+              echo "Env file not found on host: $ENV_FILE" >&2
+              exit 1
+            fi
+
             docker pull ${IMAGE_URI}
             if [ "$(docker ps -a --format '{{.Names}}' | grep -c ${{ env.NAME }})" -gt 0 ]; then
               docker rm -f ${{ env.NAME }}
             fi
-            docker run --name ${{ env.NAME }} -d -p ${{ env.OUT_PORT }}:${{ env.PORT }} ${{ env.RUN_ARGS }} --restart unless-stopped ${IMAGE_URI}
+            docker run --name ${{ env.NAME }} -d -p ${{ env.OUT_PORT }}:${{ env.PORT }} --env-file "$ENV_FILE" ${{ env.RUN_ARGS }} --restart unless-stopped ${IMAGE_URI}
             docker image prune --force
             # Disabled: the old container is already removed by name above, and pruning here would delete
             # a container that crashed on startup, taking its logs with it.
